@@ -76,3 +76,40 @@ class TestForecast(unittest.TestCase):
             all(x >= y for x, y in zip(losses[:10], losses[1:11])),
             "Losses are not monotonically decreasing.",
         )
+
+
+class TestRecursiveSplit:
+    def test_case_1(self):
+        # Test input
+        df = pd.DataFrame({"value": [10, 20, 30, 40]})
+        result = forecasting.recursive_split(df, "value", depth=2)
+
+        # Expected output
+        expected = pd.DataFrame(
+            {
+                "value": [10, 20, 30, 40],
+                "split_1": [0, 0, 1, 1],
+                "split_2": [0, 1, 0, 1],
+            }
+        )
+
+        # Assert equality
+        pd.testing.assert_frame_equal(result, expected, check_dtype=False)
+
+    def test_case_2(self):
+        # Test input
+        df = pd.DataFrame({"value": [5, 15, 25, 35, 45, 55, 65, 75]})
+        result = forecasting.recursive_split(df, "value", depth=3)
+
+        # Expected output
+        expected = pd.DataFrame(
+            {
+                "value": [5, 15, 25, 35, 45, 55, 65, 75],
+                "split_1": [0, 0, 0, 0, 1, 1, 1, 1],
+                "split_2": [0, 0, 1, 1, 0, 0, 1, 1],
+                "split_3": [0, 1, 0, 1, 0, 1, 0, 1],
+            }
+        )
+
+        # Assert equality
+        pd.testing.assert_frame_equal(result, expected, check_dtype=False)

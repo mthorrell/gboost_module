@@ -9,18 +9,42 @@ from sklearn.utils.validation import check_is_fitted
 
 
 class ForecastModule(torch.nn.Module):
-    def __init__(self, n_features, xcols=None, params=None):
+    def __init__(
+        self,
+        n_features,
+        xcols=None,
+        params=None,
+        use_batch_norm=True,
+        datetime_feature_names=None,
+    ):
         super(ForecastModule, self).__init__()
         if params is None:
             params = {}
         if xcols is None:
             xcols = []
+        if datetime_feature_names is None:
+            datetime_feature_names = [
+                "split_1",
+                "split_2",
+                "split_3",
+                "split_4",
+                "minute",
+                "hour",
+                "month",
+                "day",
+                "weekday",
+            ] + xcols
         self.seasonality = xgbmodule.XGBModule(
-            n_features, 9 + len(xcols), 1, params=params
+            n_features, len(datetime_feature_names), 1, params=params
         )
         self.xcols = xcols
+        self.datetime_feature_names = datetime_feature_names
+        self.use_batch_norm = use_batch_norm
         self.trend = torch.nn.Linear(1, 1)
-        self.bn = nn.LazyBatchNorm1d()
+        if use_batch_norm:
+            self.bn = nn.LazyBatchNorm1d()
+        else:
+            self.bn = None
         self.initialized = False
 
     def initialize(self, df):
@@ -48,26 +72,15 @@ class ForecastModule(torch.nn.Module):
         if not self.initialized:
             self.initialize(df)
 
-        datetime_features = np.array(
-            df[
-                [
-                    "split_1",
-                    "split_2",
-                    "split_3",
-                    "split_4",
-                    "minute",
-                    "hour",
-                    "month",
-                    "day",
-                    "weekday",
-                ]
-                + self.xcols
-            ]
-        )
+        datetime_features = np.array(df[self.datetime_feature_names])
         trend = torch.Tensor(df["year"].values).reshape([-1, 1])
 
         self.minput = datetime_features
-        output = self.trend(self.bn(trend)) + self.seasonality(datetime_features)
+        if self.use_batch_norm and self.bn is not None:
+            trend_output = self.trend(self.bn(trend))
+        else:
+            trend_output = self.trend(trend)
+        output = trend_output + self.seasonality(datetime_features)
         return output
 
     def gb_step(self):
@@ -75,32 +88,56 @@ class ForecastModule(torch.nn.Module):
 
 
 def recursive_split(df, column, depth):
-    """Adds columns of zeros and ones in attempt to address changepoints"""
+    """Adds columns of zeros and ones to substitute changepoints"""
     df = df.sort_values(by=column).reset_index(drop=True)
     binary_cols = pd.DataFrame(index=df.index)
 
-    def split_group(indices, level):
-        if level > depth:
-            return
-        mid = len(indices) // 2
-        binary_cols.loc[indices[:mid], f"split_{level}"] = 0
-        binary_cols.loc[indices[mid:], f"split_{level}"] = 1
-        split_group(indices[:mid], level + 1)
-        split_group(indices[mid:], level + 1)
+    current_groups = [df.index]
+    for level in range(1, depth + 1):
+        next_groups = []
+        for group in current_groups:
+            mid = len(group) // 2
+            binary_cols.loc[group[:mid], f"split_{level}"] = 0
+            binary_cols.loc[group[mid:], f"split_{level}"] = 1
+            next_groups.extend([group[:mid], group[mid:]])
+        current_groups = next_groups
 
-    split_group(df.index, 1)
+    binary_cols = binary_cols.astype("int64")
     return pd.concat([df, binary_cols], axis=1)
 
 
 class Forecast(BaseEstimator, RegressorMixin):
-    def __init__(self, nrounds=3000, xcols=None, params=None):
+    def __init__(
+        self,
+        nrounds=3000,
+        xcols=None,
+        params=None,
+        split_depth=4,
+        date_features=None,
+        use_batch_norm=True,
+        learning_rate=0.1,
+        datetime_feature_names=None,
+    ):
         if params is None:
             params = {}
         if xcols is None:
             xcols = []
+        if date_features is None:
+            date_features = ["month", "year", "day", "weekday", "hour", "minute"]
+        if datetime_feature_names is None:
+            datetime_feature_names = (
+                [f"split_{i}" for i in range(1, split_depth + 1)]
+                + date_features
+                + xcols
+            )
         self.nrounds = nrounds
         self.xcols = xcols
         self.params = params
+        self.split_depth = split_depth
+        self.date_features = date_features
+        self.use_batch_norm = use_batch_norm
+        self.learning_rate = learning_rate
+        self.datetime_feature_names = datetime_feature_names
         self.model_ = None
         self.losses_ = []
 
@@ -108,10 +145,16 @@ class Forecast(BaseEstimator, RegressorMixin):
         df = X.copy()
         df["y"] = y
         df = self._prepare_dataframe(df)
-        df = recursive_split(df, "ds", 4)
-        self.model_ = ForecastModule(df.shape[0], xcols=self.xcols, params=self.params)
+        df = recursive_split(df, "ds", self.split_depth)
+        self.model_ = ForecastModule(
+            df.shape[0],
+            xcols=self.xcols,
+            params=self.params,
+            use_batch_norm=self.use_batch_norm,
+            datetime_feature_names=self.datetime_feature_names,
+        )
         self.model_.train()
-        optimizer = torch.optim.Adam(self.model_.parameters(), lr=0.1)
+        optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate)
         mse = torch.nn.MSELoss()
 
         for _ in range(self.nrounds):
@@ -130,18 +173,24 @@ class Forecast(BaseEstimator, RegressorMixin):
         check_is_fitted(self, "model_")
         df = X.copy()
         df = self._prepare_dataframe(df)
-        for j in range(1, 5):
+        for j in range(1, self.split_depth + 1):
             df[f"split_{j}"] = 1.0
         preds = self.model_(df).detach().numpy()
         return preds.flatten()
 
-    @staticmethod
-    def _prepare_dataframe(df):
+    def _prepare_dataframe(self, df):
         df["ds"] = pd.to_datetime(df["ds"])
-        df["month"] = df["ds"].dt.month
-        df["year"] = df["ds"].dt.year
-        df["day"] = df["ds"].dt.day
-        df["weekday"] = df["ds"].dt.weekday
-        df["hour"] = df["ds"].dt.hour
-        df["minute"] = df["ds"].dt.minute
+        for feature in self.date_features:
+            if feature == "month":
+                df["month"] = df["ds"].dt.month
+            elif feature == "year":
+                df["year"] = df["ds"].dt.year
+            elif feature == "day":
+                df["day"] = df["ds"].dt.day
+            elif feature == "weekday":
+                df["weekday"] = df["ds"].dt.weekday
+            elif feature == "hour":
+                df["hour"] = df["ds"].dt.hour
+            elif feature == "minute":
+                df["minute"] = df["ds"].dt.minute
         return df
