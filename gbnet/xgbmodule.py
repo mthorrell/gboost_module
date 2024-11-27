@@ -20,13 +20,21 @@ class XGBModule(nn.Module):
         self.params = params
         self.params["objective"] = "reg:squarederror"
         self.params["base_score"] = 0
+        if xgb.__version__ < "1.5.0":
+            self.params["num_class"] = self.output_dim
+
         self.n_completed_boost_rounds = 0
 
         init_matrix = np.zeros([batch_size, input_dim])
+        mmm = xgb.DMatrix(init_matrix, label=np.ones([batch_size, 1]))
         self.bst = xgb.train(
             self.params,
-            xgb.DMatrix(init_matrix, label=np.zeros(batch_size * output_dim)),
-            num_boost_round=0,
+            mmm,
+            num_boost_round=1,
+            obj=XGBObj(
+                torch.zeros([batch_size, output_dim]),
+                torch.zeros([batch_size, output_dim]),
+            ),
         )
         self.n_completed_boost_rounds = 0
         self.dtrain = None
@@ -43,11 +51,11 @@ class XGBModule(nn.Module):
         # TODO figure out actual batch training
         if self.training:
             if self.dtrain is not None:
-                preds = self.bst.predict(self.dtrain)
+                preds = self.bst.predict(self.dtrain, output_margin=True)
             else:
-                preds = self.bst.predict(xgb.DMatrix(input_array))
+                preds = self.bst.predict(xgb.DMatrix(input_array), output_margin=True)
         else:
-            preds = self.bst.predict(xgb.DMatrix(input_array))
+            preds = self.bst.predict(xgb.DMatrix(input_array), output_margin=True)
 
         if self.training:
             FX_detach = self.FX.detach()
@@ -83,18 +91,12 @@ class XGBModule(nn.Module):
 
         obj = XGBObj(grad, hess)
         if self.dtrain is None:
-            self.dtrain = xgb.DMatrix(
-                input_array, label=np.zeros(self.batch_size * self.output_dim)
-            )
+            self.dtrain = xgb.DMatrix(input_array, label=np.zeros([self.batch_size, 1]))
 
         g, h = obj(np.zeros([self.batch_size, self.output_dim]), None)
 
         if xgb.__version__ <= "2.0.3":
-            self.bst.boost(
-                self.dtrain,
-                g,
-                h,
-            )
+            self.bst.update(self.dtrain, self.n_completed_boost_rounds + 1, fobj=obj)
         else:
             self.bst.boost(
                 self.dtrain,
