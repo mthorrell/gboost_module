@@ -8,8 +8,11 @@ from torch import nn
 
 
 class XGBModule(nn.Module):
-    def __init__(self, batch_size, input_dim, output_dim, params={}, min_hess=0):
+    def __init__(
+        self, batch_size, input_dim, output_dim, params={}, min_hess=0, batch_mode=False
+    ):
         super(XGBModule, self).__init__()
+        self.batch_mode = batch_mode
         self.batch_size = batch_size
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -48,7 +51,7 @@ class XGBModule(nn.Module):
     ):
         assert isinstance(input_data, (xgb.DMatrix, pd.DataFrame, np.ndarray))
         if self.training:
-            if self.dtrain is None:
+            if self.dtrain is None or self.batch_mode:
                 if isinstance(input_data, xgb.DMatrix):
                     input_data.set_label(np.zeros(self.batch_size * self.output_dim))
                     self.dtrain = input_data
@@ -65,7 +68,7 @@ class XGBModule(nn.Module):
                 else input_data.shape[0]
             )
             assert (
-                compare_n == self.training_n
+                (compare_n == self.training_n) or self.batch_mode
             ), "Changing datasets while training is not currently supported. If trying to make predictions, set Module to eval mode via `Module.eval()`"
             return self.dtrain
         return (
