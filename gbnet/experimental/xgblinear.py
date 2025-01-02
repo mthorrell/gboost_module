@@ -16,6 +16,8 @@ class GBLinear(torch.nn.Module):
 
         # random initialization for self.linear should be OK
         self.linear = torch.nn.Linear(self.in_dim, self.out_dim)
+        torch.nn.init.zeros_(self.linear.weight)
+        torch.nn.init.zeros_(self.linear.bias)
         self.gblinear = XGBModule(
             n, self.in_dim, self.out_dim, params, min_hess=min_hess, batch_mode=True
         )
